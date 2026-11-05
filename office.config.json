@@ -1,5 +1,18 @@
 {
   "port": 4317,
+  "feedOnly": true,
+  "ledger": { "path": "hudson-task-ledger.json" },
+  "adapters": { "grok": false, "claude": false, "codex": false, "usage": false },
+  "roster": [
+    { "id": "jody", "name": "Jody", "role": "Chief of Staff / Coordinator", "theme": "ops", "color": "#4F8DFF" },
+    { "id": "dean", "name": "Dean", "role": "Academic Director", "theme": "research", "color": "#8B6CFF" },
+    { "id": "quinn", "name": "Quinn", "role": "Study Coach", "theme": "research", "color": "#38BDF8", "reportsTo": "dean" },
+    { "id": "doug", "name": "Doug", "role": "Shift Manager", "theme": "ops", "color": "#F5C04A" },
+    { "id": "poppy", "name": "Poppy", "role": "Lifestyle Director", "theme": "care", "color": "#F472B6" },
+    { "id": "mel", "name": "Mel", "role": "Executive Assistant / Inbox", "theme": "writing", "color": "#22B8A8" },
+    { "id": "bell", "name": "Bell", "role": "Communications Director", "theme": "social", "color": "#A78BFA", "reportsTo": "mel" },
+    { "id": "vita", "name": "Vita", "role": "Health and Food Assistant", "theme": "health", "color": "#2FBF71", "private": true }
+  ],
   "agents": {},
   "grok": { "private": [] },
   "claude": { "name": "Claude", "color": "#D97757", "desks": 3, "maxOnFloor": 6, "lingerSeconds": 8 },

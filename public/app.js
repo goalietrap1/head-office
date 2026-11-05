@@ -1908,9 +1908,26 @@ function connect() {
   es.addEventListener('feed', (e) => { feed.unshift(JSON.parse(e.data)); feed = feed.slice(0, 80); renderFeed(); });
 }
 
+const privateViews = new Map();
+function refreshPrivate(a) {
+  if (!a?.private) return;
+  const prev = privateViews.get(a.id);
+  if (prev && prev.updatedAt === a.updatedAt) return;
+  privateViews.set(a.id, { updatedAt: a.updatedAt, detail: prev?.detail || null });
+  fetch(`/api/private/${encodeURIComponent(a.id)}`, { headers: { 'x-office-token': TOKEN } })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((body) => {
+      if (!body?.detail) return;
+      privateViews.set(a.id, { updatedAt: a.updatedAt, detail: body.detail });
+      if (selectedId === a.id) renderDetail();
+    })
+    .catch(() => {});
+}
+
 function upsert(a) {
   const prev = agents.get(a.id);
   agents.set(a.id, a);
+  if (a.private) refreshPrivate(a);
   if (a.source === 'claude') refreshStudio(); else updateBot(a);
   if (a.status === 'needs_you' && prev && prev.status !== 'needs_you') notify(a);
 }
@@ -2028,7 +2045,8 @@ const ago = (ts) => { const s = Math.max(0, (Date.now() - ts) / 1000 | 0); retur
 const clockTime = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const pill = (s) => `<span class="pill ${s === 'needs_you' ? 'alarm' : ''}" style="--c:${st(s).color}"><i class="dot"></i>${st(s).label}</span>`;
 const mini = (a) => `<span class="mini ${a.status === 'offline' ? 'off' : ''} ${a.source === 'claude' ? 'claude' : 'grok'}" data-shape="${esc(a.shape || 'blob')}" style="--c:${a.color}"></span>`;
-const SOURCE = { grok: 'Grok Bot', claude: 'Claude Code', demo: 'Demo' };
+const SOURCE = { grok: 'Grok Bot', claude: 'Claude Code', demo: 'Demo', roster: 'Office', ledger: 'Ledger' };
+const reportsWho = (a) => a?.reportsTo ? (a.reportsToName || a.reportsTo) : '';
 const ORDER = { needs_you: 0, error: 1 };
 const rank = (a) => ORDER[a.status] ?? (STATUS[a.status]?.busy ? 2 : 3);
 const sortAgents = (list) => list.sort((a, b) => !!b.primary - !!a.primary || rank(a) - rank(b) || a.name.localeCompare(b.name)); // the boss heads its group
@@ -2059,14 +2077,14 @@ function renderTeam() {
   const all = [...agents.values()].filter((a) => !a.away);
   document.getElementById('dock-count').textContent = all.length ? `${all.length} in the office` : '';
   if (!all.length) { el.innerHTML = `<div class="empty">No agents yet. Open the Grok Bot app or start a Claude Code session and they'll walk in.</div>`; return; }
-  const groups = [['Grok Bots', all.filter((a) => a.source === 'grok')], ['Claude', all.filter((a) => a.source === 'claude')], ['Demo', all.filter((a) => a.source === 'demo')], ['Other', all.filter((a) => !['grok', 'claude', 'demo'].includes(a.source))]];
+  const groups = [['Office', all.filter((a) => a.source === 'roster' || a.source === 'ledger')], ['Grok Bots', all.filter((a) => a.source === 'grok')], ['Claude', all.filter((a) => a.source === 'claude')], ['Demo', all.filter((a) => a.source === 'demo')], ['Other', all.filter((a) => !['grok', 'claude', 'demo', 'roster', 'ledger'].includes(a.source))]];
   // Status shows as the ring round the avatar (spinning while busy, pulsing when it needs you) plus one quiet word.
   const row = (a) => {
     const s = a.away ? 'offline' : a.status, busy = STATUS[s]?.busy;
     return `
       <button class="row ${a.id === selectedId ? 'sel' : ''} ${s === 'needs_you' ? 'hot' : ''} ${a.away ? 'away' : ''}" data-id="${esc(a.id)}" style="--s:${st(s).color}">
         <span class="ava ${busy ? 'busy' : esc(s)}">${mini(a)}</span>
-        <div><span class="name">${esc(a.name)}${a.primary ? '<span class="boss">Boss</span>' : ''}${a.unread ? `<span class="unread">${a.unread}</span>` : ''}</span><span class="role">${esc(a.role)}</span></div>
+        <div><span class="name">${esc(a.name)}${a.primary ? '<span class="boss">Boss</span>' : ''}${a.unread ? `<span class="unread">${a.unread}</span>` : ''}</span><span class="role">${esc(a.role)}${a.reportsTo ? ` · reports to ${esc(reportsWho(a))}` : ''}</span></div>
         <span class="state ${busy || s === 'needs_you' || s === 'error' ? '' : 'quiet'} ${s === 'needs_you' ? 'alarm' : ''}">${a.away ? 'Resting' : st(s).label}</span>
       </button>`;
   };
@@ -2129,6 +2147,19 @@ function select(id) {
   else setTimeout(() => teamEl.querySelector(`.row[data-id="${CSS.escape(selectedId)}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 60);
 }
 
+function privateBlock(detail) {
+  if (!detail) return 'Private feed is loading for this office.';
+  const tasks = Array.isArray(detail.tasks) ? detail.tasks : (detail.task ? [detail.task] : []);
+  const lines = [];
+  if (typeof detail.activity === 'string' && detail.activity) lines.push(`<div class="now">${esc(detail.activity)}</div>`);
+  for (const t of tasks) {
+    if (!t?.title) continue;
+    lines.push(`<div class="task">${esc(t.title)}${t.status ? ` · ${esc(t.status)}` : ''}${t.owner ? ` · owner ${esc(t.owner)}` : ''}</div>`);
+  }
+  if (detail.pending?.detail) lines.push(`<div class="now">${esc(detail.pending.detail)}</div>`);
+  return lines.join('') || 'No private task is recorded.';
+}
+
 function renderDetail() {
   // The right sidebar shows the activity feed, or the selected agent's details and history in its place.
   const el = document.getElementById('detail');
@@ -2148,7 +2179,9 @@ function renderDetail() {
       <div><span>Last active</span><b>${a.activeAt ? ago(a.activeAt) : '—'}</b></div>
       <div><span>Events</span><b>${a.log.length}</b></div>
     </div>
-    ${a.task?.title ? `<div class="k">Task</div><div class="task">${esc(a.task.title)}</div>` : ''}
+    ${a.reportsTo ? `<div class="k">Reports to</div><div class="now">${esc(reportsWho(a))}</div>` : ''}
+    ${Array.isArray(a.tasks) && a.tasks.length ? `<div class="k">Tasks</div>${a.tasks.map((t) => `<div class="task">${esc(t.title)}${t.status ? ` · ${esc(t.status)}` : ''}${t.owner ? ` · owner ${esc(t.owner)}` : ''}</div>`).join('')}` : (a.task?.title ? `<div class="k">Task</div><div class="task">${esc(a.task.title)}${a.task.owner ? ` · owner ${esc(a.task.owner)}` : ''}${a.task.status ? ` · ${esc(a.task.status)}` : ''}</div>` : '')}
+    ${a.private ? `<div class="k">Private</div><div class="now">${privateBlock(privateViews.get(a.id)?.detail)}</div>` : ''}
     <div class="k">Right now</div><div class="now">${esc(a.activity)} <span class="muted">· for ${ago(a.since).replace(' ago', '')}</span></div>
     ${p ? `<div class="ask"><b>${esc(p.title)}</b><p>${esc(p.detail)}</p></div>
       ${p.canResolve ? `<div class="actions"><button class="btn primary" data-decide="allow">Approve</button><button class="btn" data-decide="deny">Decline</button><button class="btn ghost" data-dismiss title="Clear this without answering">Dismiss</button></div><div class="hint">${esc(a.name)} is waiting on this. Your answer goes straight back to it.</div>`
@@ -2173,7 +2206,7 @@ document.getElementById('detail').addEventListener('click', async (e) => {
 });
 
 function renderFeed() {
-  document.getElementById('feed').innerHTML = feed.slice(0, 40).map((f) => `<li ${agents.has(f.agentId) ? `data-id="${esc(f.agentId)}" class="link"` : ''}><time>${clockTime(f.ts)}</time><i class="dot" style="background:${st(f.status).color}"></i><span><b>${esc(f.name)}</b> ${esc(f.text)}</span></li>`).join('') || '<li class="empty" style="display:block">Quiet so far.</li>';
+  document.getElementById('feed').innerHTML = feed.slice(0, 40).map((f) => `<li ${agents.has(f.agentId) ? `data-id="${esc(f.agentId)}" class="link"` : ''}><time>${clockTime(f.ts)}</time><i class="dot" style="background:${st(f.status).color}"></i><span><b>${esc(f.name)}</b> ${esc(f.text || st(f.status).label)}</span></li>`).join('') || '<li class="empty" style="display:block">Quiet so far.</li>';
 }
 
 document.getElementById('feed').addEventListener('click', (e) => { const r = e.target.closest('[data-id]'); if (r) select(r.dataset.id); });

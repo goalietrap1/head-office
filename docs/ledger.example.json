@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "agents": [
+    { "id": "jody", "name": "Jody", "role": "Chief of Staff / Coordinator" },
+    { "id": "dean", "name": "Dean", "role": "Academic Director" },
+    { "id": "quinn", "name": "Quinn", "role": "Study Coach", "reportsTo": "dean" },
+    { "id": "doug", "name": "Doug", "role": "Shift Manager" },
+    { "id": "poppy", "name": "Poppy", "role": "Lifestyle Director" },
+    { "id": "mel", "name": "Mel", "role": "Executive Assistant / Inbox" },
+    { "id": "bell", "name": "Bell", "role": "Communications Director", "reportsTo": "mel" },
+    { "id": "vita", "name": "Vita", "role": "Health and Food Assistant", "private": true }
+  ]
+}
