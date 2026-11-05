@@ -20,6 +20,10 @@ npm start
 
 Then open **http://127.0.0.1:4317**. The first time, you'll pick an office size and whether to start furnished or empty.
 
+This fork ships with **`feedOnly: true`**. `npm start` does not read the Grok Bot cache, Claude Code sessions, Codex sessions, or plan-usage files. Status comes from `hudson-task-ledger.json` (if you put one next to `office.config.json`) and from `POST /api/event`. The eight-person roster is Jody, Dean, Quinn, Doug, Poppy, Mel, Bell, and Vita. Vita is private: task text stays off the public stream and the activity feed. Set `"feedOnly": false` to bring the cache adapters back, one at a time with `adapters`.
+
+`node scripts/check-feed-only.mjs` reruns the isolated checks. It uses a temporary home directory and does not read a real Grok, Claude, or Codex cache.
+
 Want to see it busy before connecting anything?
 
 ```bash
@@ -115,7 +119,8 @@ Statuses: `thinking coding terminal browsing reading working delegating needs_yo
                                        └── ~/.head-office/  (token, url, layout, dismissed)
 ```
 
-- **`server.mjs`** is a small Node server with no dependencies. It keeps the roster, watches local files, accepts events and streams updates to the page.
+- **`server.mjs`** is a small Node server with no dependencies. It keeps the roster, watches local files, accepts events and streams updates to the page. With `feedOnly: true` it does not load `adapters/grok/watch.mjs`, `adapters/claude-code/sessions.mjs`, `adapters/codex/sessions.mjs`, or `adapters/usage.mjs`.
+- **`adapters/ledger.mjs`** reads the JSON ledger and re-reads it when that file changes.
 - **Hooks** (`adapters/claude-code/hook.mjs`, `adapters/codex/hook.mjs`) run outside the model, post one small event and print nothing, so they add nothing to the model's context. The one exception is a permission request, where they print the Allow / Deny you chose in the office.
 - **The page** (`public/`) is plain ES modules. Three.js loads from the jsDelivr CDN, so the browser needs internet access the first time.
 
@@ -138,6 +143,14 @@ scripts/demo.mjs        pretend agents
 ```json
 {
   "port": 4317,
+  "feedOnly": true,
+  "ledger": { "path": "hudson-task-ledger.json" },
+  "adapters": { "grok": false, "claude": false, "codex": false, "usage": false },
+  "roster": [
+    { "id": "jody", "name": "Jody", "role": "Chief of Staff / Coordinator", "theme": "ops", "color": "#4F8DFF" },
+    { "id": "quinn", "name": "Quinn", "role": "Study Coach", "theme": "research", "reportsTo": "dean" },
+    { "id": "vita", "name": "Vita", "role": "Health and Food Assistant", "theme": "health", "private": true }
+  ],
   "grok": { "private": ["Solace"] },
   "agents": {
     "grok:Penny": { "role": "Money", "theme": "finance", "look": "visor" }
@@ -147,13 +160,24 @@ scripts/demo.mjs        pretend agents
 }
 ```
 
+- `feedOnly`: when `true`, the Grok, Claude, Codex, and usage readers are not loaded and do not poll. This wins over `adapters.*` and over `codex.enabled`. Omit it, or set it to `false`, for the original cache readers.
+- `adapters.grok`, `adapters.claude`, `adapters.codex`, `adapters.usage`: each can be `false` while the others stay on. Used only when `feedOnly` is not `true`. `adapters.codex: false` also skips the check for a `~/.codex` folder.
+- `ledger.path`: JSON snapshot to read and watch. A relative path is resolved from the config file's directory. `~` is expanded. A missing file is fine: the roster still appears, and the server notices the file when it is created. There is no timer; the directory is watched.
+- `roster`: people who should be in the office even before a ledger row exists. `id`, `name`, `role`, `theme`, `color`, `reportsTo` (another roster id), and `private`. A roster entry with `private: true` stays private. No task is invented for them.
+
+### Ledger file
+
+`docs/ledger.example.json` is the shape. A snapshot is `{ "version": 1, "agents": [ ... ] }` or a bare array. Each agent needs `id`. These fields are copied only when present: `name`, `role`, `theme`, `color`, `reportsTo`, `private`, `status`, `activity`, `updatedAt`, `tasks`. A task needs a `title`; without one it is dropped. `status` must be one of `thinking coding terminal browsing reading working delegating needs_you error done idle offline`. `owner` and `updatedAt` are kept when the file has them. `id` values `jody` and `roster:jody` are the same person. An omitted field is left as it was. An empty `tasks` array clears tasks.
+
+Private agents (Vita, and any row or task with `"private": true`) keep `activity`, task titles, and pending text in a token-gated store. `GET /api/private/<id>` with `x-office-token` returns that store. The SSE stream, the activity feed, and agent broadcasts carry the status word only (`Working`, `Idle`, …), never the private text. `grok.private` is still display redaction for the Grok cache reader, and it is separate from this.
+
 - `grok.private`: bots whose message text never appears in the office, only their status.
 - `agents["grok:<Name>"]`: override a bot's `role`, `theme`, `look` or `color`.
   - Themes: `ops code research design finance social writing security health care career`
   - Looks: `cap crown glasses shades headset headband beret beanie visor bloom tie`
 - `claude.maxOnFloor`: most chats shown on Claude's monitor at once. `lingerSeconds`: how long a finished chat stays up.
-- `codex.enabled`: force the Codex wing on or off.
-- `quietAfterMinutes`: when "Done" turns to "Idle".
+- `codex.enabled`: force the Codex wing on or off. Ignored while `feedOnly` is true. `adapters.codex: false` also forces it off.
+- `quietAfterMinutes`: when "Done" turns to "Idle" for custom agents. Roster and ledger agents keep the status from the snapshot.
 
 To run on another port: `OFFICE_PORT=4318 npm start`. The hooks follow automatically, because the server writes its address to `~/.head-office/url`.
 

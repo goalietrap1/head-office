@@ -8,16 +8,17 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { readGrokBots, watchGrokBots, grokAppRunning } from './adapters/grok/watch.mjs';
-import { readClaudeSessions, watchClaudeSessions } from './adapters/claude-code/sessions.mjs';
-import { readCodexSessions, watchCodexSessions, codexInstalled } from './adapters/codex/sessions.mjs';
-import { watchUsage } from './adapters/usage.mjs';
+import { readLedger, watchLedger } from './adapters/ledger.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
 const expand = (p) => p.replace(/^~(?=$|\/)/, os.homedir());
 
-const config = JSON.parse(fs.readFileSync(path.join(ROOT, 'office.config.json'), 'utf8'));
+const configPath = process.env.OFFICE_CONFIG
+  ? (path.isAbsolute(expand(process.env.OFFICE_CONFIG)) ? expand(process.env.OFFICE_CONFIG) : path.resolve(expand(process.env.OFFICE_CONFIG)))
+  : path.join(ROOT, 'office.config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+const configDir = path.dirname(configPath);
 const PORT = Number(process.env.OFFICE_PORT || config.port || 4317);
 const QUIET_MS = (config.quietAfterMinutes ?? 10) * 60_000;
 const FORGET_MS = (config.forgetClaudeSessionAfterMinutes ?? 120) * 60_000;
@@ -32,9 +33,28 @@ const STUDIOS = {
   codex: { name: 'Codex', color: '#ECEBF3', ...config.codex },
 };
 const isStudio = (source) => !!STUDIOS[source];
-// The OpenAI wing only exists for people who use Codex (or switch it on in office.config.json).
-const codexWing = () => config.codex?.enabled ?? codexInstalled();
-const wings = () => (codexWing() ? ['codex'] : []);
+// feedOnly forces every cache adapter off, including when adapters.* is also true.
+// With feedOnly false, adapters.<name>: false turns that one reader off.
+// Codex still honours codex.enabled, and otherwise opens only when Codex is installed.
+const FEED_ONLY = config.feedOnly === true;
+const adapterFlag = (name) => (config.adapters && Object.prototype.hasOwnProperty.call(config.adapters, name) ? config.adapters[name] !== false : null);
+const adapterEnabled = (name) => {
+  if (FEED_ONLY) return false;
+  if (adapterFlag(name) === false) return false;
+  return true;
+};
+function codexDesired() {
+  if (FEED_ONLY || config.adapters?.codex === false || config.codex?.enabled === false) return 'off';
+  if (config.codex?.enabled === true || config.adapters?.codex === true) return 'on';
+  return 'auto';
+}
+let codexOn = false;
+const wings = () => (codexOn ? ['codex'] : []);
+
+const STATUS_WORD = {
+  thinking: 'Thinking', coding: 'Coding', terminal: 'In terminal', browsing: 'Browsing', reading: 'Reading',
+  working: 'Working', delegating: 'Delegating', needs_you: 'Needs you', error: 'Error', done: 'Done', idle: 'Idle', offline: 'Offline',
+};
 
 // A per-machine token. Custom headers force a CORS preflight (which we never
 // grant), so random websites can't fake events or approve permissions.
@@ -83,7 +103,60 @@ for (const [id, overrides] of Object.entries(config.agents || {})) {
   if (!id.startsWith('grok:') && !agents.has(id)) agents.set(id, baseAgent(id, { source: id.split(':')[0], ...overrides }));
 }
 
-const publicAgent = ({ log, ...a }) => ({ ...a, log: log.slice(-25) });
+const officeId = (raw) => (raw && String(raw).includes(':') ? String(raw) : `roster:${raw}`);
+const ROSTER = (Array.isArray(config.roster) ? config.roster : []).filter((p) => p && typeof p.id === 'string' && p.id.trim());
+const rosterPrivate = new Set(ROSTER.filter((p) => p.private === true).map((p) => officeId(p.id.trim())));
+const rosterById = new Map(ROSTER.map((p) => [officeId(p.id.trim()), p]));
+
+function seedRoster() {
+  for (const person of ROSTER) {
+    const id = officeId(person.id.trim());
+    if (agents.has(id)) continue;
+    const priv = person.private === true;
+    agents.set(id, baseAgent(id, {
+      source: 'roster',
+      name: typeof person.name === 'string' && person.name.trim() ? person.name.trim() : person.id.trim(),
+      role: typeof person.role === 'string' ? person.role : '',
+      theme: person.theme || 'ops',
+      color: person.color || '#8A8FA3',
+      reportsTo: person.reportsTo || null,
+      private: priv,
+      status: 'idle',
+      activity: priv ? 'Idle' : 'Free for a new task',
+      privateDetail: priv ? {} : null,
+    }));
+  }
+}
+seedRoster();
+
+function reportsToName(agent) {
+  if (!agent.reportsTo) return null;
+  const id = String(agent.reportsTo).includes(':') ? agent.reportsTo : officeId(agent.reportsTo);
+  return agents.get(id)?.name || null;
+}
+
+// Public projections never carry privateDetail, private task titles, or private activity text.
+function viewAgent(agent) {
+  const { log = [], privateDetail, tasks, ...rest } = agent;
+  const view = {
+    ...rest,
+    reportsToName: reportsToName(agent),
+    log: log.slice(-25).map((e) => (agent.private ? { ...e, text: '' } : e)),
+  };
+  delete view.privateDetail;
+  if (agent.private) {
+    view.activity = STATUS_WORD[agent.status] || 'Idle';
+    view.detail = '';
+    view.task = null;
+    view.tasks = null;
+    view.pending = agent.pending
+      ? { id: agent.pending.id, kind: agent.pending.kind || 'question', title: 'Needs you', detail: '', canResolve: !!agent.pending.canResolve, createdAt: agent.pending.createdAt }
+      : null;
+  } else {
+    view.tasks = Array.isArray(tasks) ? tasks.filter((t) => !t?.private) : null;
+  }
+  return view;
+}
 
 function broadcast(type, data) {
   const frame = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -91,7 +164,7 @@ function broadcast(type, data) {
 }
 
 function pushFeed(agent, text, status) {
-  const entry = { ts: Date.now(), agentId: agent.id, name: agent.name, color: agent.color, status, text };
+  const entry = { ts: Date.now(), agentId: agent.id, name: agent.name, color: agent.color, status, text: agent.private ? '' : text };
   agent.log.push(entry);
   if (agent.log.length > 60) agent.log.splice(0, agent.log.length - 60);
   feed.push(entry);
@@ -107,7 +180,7 @@ function setStatus(agent, patch, { log = true } = {}) {
   if (log && (agent.status !== prevStatus || agent.activity !== prevActivity) && agent.activity) {
     pushFeed(agent, agent.activity, agent.status);
   }
-  broadcast('agent', publicAgent(agent));
+  broadcast('agent', viewAgent(agent));
 }
 
 function removeAgent(id) {
@@ -133,7 +206,7 @@ function updateFloor() {
     for (const a of agents.values()) {
       if (a.source !== source) continue;
       const away = !floor.has(a.id);
-      if (a.away !== away) { a.away = away; broadcast('agent', publicAgent(a)); }
+      if (a.away !== away) { a.away = away; broadcast('agent', viewAgent(a)); }
     }
     ends.push(...wanted.filter((a) => rank(a) === 3).map((a) => (a.activeAt || 0) + LINGER_MS - now));
   }
@@ -159,14 +232,33 @@ function ingest(ev) {
       away: studio ? true : undefined,
       shape: ev.shape || 'blob',
       role: ev.role || (studio ? path.basename(ev.cwd || '') || studio.name : ''),
+      private: rosterPrivate.has(ev.agentId) || ev.private === true,
       ...(config.agents?.[ev.agentId] || {}),
     });
     agents.set(agent.id, agent);
   }
+  if (rosterPrivate.has(agent.id) || ev.private === true) agent.private = true;
+  else if (ev.private === false) agent.private = false;
+
+  if (agent.private) {
+    const detail = { ...(agent.privateDetail || {}) };
+    if (ev.activity !== undefined) detail.activity = String(ev.activity).slice(0, 160);
+    if (ev.detail !== undefined) detail.detail = String(ev.detail).slice(0, 500);
+    if (ev.task !== undefined) detail.task = ev.task;
+    if (ev.pending) detail.pending = ev.pending;
+    agent.privateDetail = detail;
+    ev = {
+      ...ev,
+      activity: ev.activity !== undefined ? (STATUS_WORD[ev.status || agent.status] || 'Idle') : undefined,
+      detail: ev.detail !== undefined ? '' : undefined,
+      task: ev.task !== undefined ? null : undefined,
+      pending: ev.pending ? { id: ev.pending.id, kind: ev.pending.kind || 'question', title: 'Needs you', detail: '', canResolve: !!ev.pending.canResolve } : ev.pending,
+    };
+  }
 
   if (ev.viaHook) agent.lastHookAt = Date.now();
   const patch = {};
-  for (const k of ['name', 'role', 'theme', 'shape', 'cwd', 'detail', 'task']) if (ev[k] !== undefined) patch[k] = ev[k];
+  for (const k of ['name', 'role', 'theme', 'shape', 'cwd', 'detail', 'task', 'reportsTo']) if (ev[k] !== undefined) patch[k] = ev[k];
   if (ev.status) patch.status = ev.status;
   if (ev.activity !== undefined) patch.activity = String(ev.activity).slice(0, 160);
 
@@ -228,6 +320,7 @@ setInterval(() => {
   for (const a of agents.values()) {
     const age = now - a.updatedAt;
     if (a.source === 'grok') continue; // the Grok watcher keeps these honest itself
+    if (a.source === 'roster' || a.source === 'ledger') continue; // the ledger snapshot is the status
     if (isStudio(a.source) && !a.id.includes(':demo')) continue; // the session readers handle these
     if (WORKING.has(a.status) && age > QUIET_MS) setStatus(a, { status: 'idle', activity: 'Quiet for a while' });
     else if (a.status === 'done' && age > 45_000) setStatus(a, calm(a), { log: false });
@@ -235,12 +328,9 @@ setInterval(() => {
   updateFloor();
 }, 10_000);
 
-// Grok Bots: read from the Grok Bot app's own local cache (see adapters/grok/watch.mjs).
-// Names, jobs, avatar shape and colour come from your roster; status from each bot's chat.
-// config.agents["grok:<Name>"] overrides any field; config.grok.private hides a bot's message text.
-// config.grok.primary names the boss (who gets the corner office) if the guess is wrong.
+// Cache adapters are loaded only when that adapter is enabled. feedOnly never reaches these.
 const PRIVATE = new Set((config.grok?.private || []).map((n) => n.toLowerCase()));
-function syncGrok() {
+function syncGrok(readGrokBots, grokAppRunning) {
   const running = grokAppRunning();
   const seen = new Set();
   for (const bot of readGrokBots({ private: PRIVATE, primary: config.grok?.primary })) {
@@ -263,7 +353,6 @@ function syncGrok() {
   }
   for (const a of [...agents.values()]) if (a.source === 'grok' && !seen.has(a.id)) removeAgent(a.id);
 }
-watchGrokBots(syncGrok);
 
 // Claude Code and Codex sessions, read from each tool's own local session files
 // (adapters/claude-code/sessions.mjs, adapters/codex/sessions.mjs). Works with no setup. When the
@@ -296,12 +385,115 @@ function syncStudio(source, sessions) {
   updateFloor();
 }
 const clipTitle = (t) => { t = String(t || '').trim(); return t.length > 32 ? t.slice(0, 31) + '…' : t; };
-watchClaudeSessions(() => syncStudio('claude', readClaudeSessions({ activeMs: FORGET_MS })));
-if (codexWing()) watchCodexSessions(() => syncStudio('codex', readCodexSessions({ activeMs: FORGET_MS })));
 
-// Plan usage for the meter on the wall (adapters/usage.mjs).
 let usage = null;
-watchUsage((u) => { usage = u; broadcast('usage', u); });
+
+function publicTask(t) {
+  if (!t || t.private) return null;
+  const out = { title: t.title };
+  if (t.id) out.id = t.id;
+  if (t.status) out.status = t.status;
+  if (t.owner) out.owner = t.owner;
+  if (t.updatedAt !== undefined) out.updatedAt = t.updatedAt;
+  return out;
+}
+
+function applyLedger(rows) {
+  for (const row of rows) {
+    const id = officeId(row.id);
+    let agent = agents.get(id);
+    const isNew = !agent;
+    if (!agent) {
+      agent = baseAgent(id, { source: 'ledger', name: row.name || row.id, private: row.private === true });
+      agents.set(id, agent);
+    }
+    if (rosterPrivate.has(id) || row.private === true) agent.private = true;
+    else if (row.private === false) agent.private = false;
+    const beforeDetail = JSON.stringify(agent.privateDetail || null);
+    const patch = {};
+    for (const k of ['name', 'role', 'theme', 'color', 'reportsTo']) if (row[k] !== undefined) patch[k] = row[k];
+    if (row.status) patch.status = row.status;
+    if (row.updatedAt !== undefined) patch.ledgerAt = row.updatedAt;
+    if (agent.private) {
+      const detail = { ...(agent.privateDetail || {}) };
+      if (row.activity !== undefined) detail.activity = row.activity;
+      if (row.tasks) {
+        detail.tasks = row.tasks;
+        detail.task = row.tasks.length === 1 ? row.tasks[0] : null;
+      }
+      agent.privateDetail = detail;
+      agent.tasks = null;
+      patch.task = null;
+      patch.detail = '';
+      if (row.status || row.activity !== undefined) patch.activity = STATUS_WORD[row.status || agent.status] || 'Idle';
+    } else {
+      if (row.activity !== undefined) patch.activity = row.activity;
+      if (row.tasks) {
+        const pub = row.tasks.map(publicTask).filter(Boolean);
+        const hidden = row.tasks.filter((t) => t.private);
+        agent.tasks = pub;
+        patch.task = pub.length === 1 ? pub[0] : null;
+        const nextDetail = { ...(agent.privateDetail || {}) };
+        if (hidden.length) nextDetail.tasks = hidden;
+        else delete nextDetail.tasks;
+        agent.privateDetail = Object.keys(nextDetail).length ? nextDetail : null;
+      }
+    }
+    agent.fromLedger = true;
+    const changed = isNew || Object.entries(patch).some(([k, v]) => JSON.stringify(agent[k]) !== JSON.stringify(v));
+    const detailChanged = JSON.stringify(agent.privateDetail || null) !== beforeDetail;
+    if (changed || detailChanged) {
+      setStatus(agent, patch, { log: !isNew && (!!patch.status || (!agent.private && patch.activity !== undefined)) });
+    }
+  }
+}
+
+function ledgerPath() {
+  const p = config.ledger?.path ?? config.ledgerPath;
+  if (!p || typeof p !== 'string') return null;
+  const expanded = expand(p);
+  return path.isAbsolute(expanded) ? expanded : path.resolve(configDir, expanded);
+}
+
+let ledgerNote = null;
+function startLedger() {
+  const file = ledgerPath();
+  if (!file) return;
+  watchLedger(file, (rows, err) => {
+    if (err) {
+      const sig = `${err.code || ''}:${err.message}`;
+      if (sig !== ledgerNote) {
+        ledgerNote = sig;
+        if (err.code === 'ENOENT') console.log(`Ledger file not found (${file}). Roster only, until it appears.`);
+        else console.log(`Ledger not loaded: ${err.code === 'EBADLEDGER' ? err.message : 'invalid JSON'}`);
+      }
+      return;
+    }
+    ledgerNote = null;
+    applyLedger(rows);
+  });
+}
+
+async function startAdapters() {
+  if (adapterEnabled('grok')) {
+    const { readGrokBots, watchGrokBots, grokAppRunning } = await import('./adapters/grok/watch.mjs');
+    watchGrokBots(() => syncGrok(readGrokBots, grokAppRunning));
+  }
+  if (adapterEnabled('claude')) {
+    const { readClaudeSessions, watchClaudeSessions } = await import('./adapters/claude-code/sessions.mjs');
+    watchClaudeSessions(() => syncStudio('claude', readClaudeSessions({ activeMs: FORGET_MS })));
+  }
+  const codexMode = codexDesired();
+  if (codexMode !== 'off') {
+    const { readCodexSessions, watchCodexSessions, codexInstalled } = await import('./adapters/codex/sessions.mjs');
+    codexOn = codexMode === 'on' || codexInstalled();
+    if (codexOn) watchCodexSessions(() => syncStudio('codex', readCodexSessions({ activeMs: FORGET_MS })));
+  }
+  if (adapterEnabled('usage')) {
+    const { watchUsage } = await import('./adapters/usage.mjs');
+    watchUsage((u) => { usage = u; broadcast('usage', u); });
+  }
+}
 
 // ---------------------------------------------------------------- http
 
@@ -329,7 +521,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/api/stream') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      res.write(`event: snapshot\ndata: ${JSON.stringify({ agents: [...agents.values()].map(publicAgent), feed: feed.slice(-60), usage, config: { studios: STUDIOS, wings: wings() } })}\n\n`);
+      res.write(`event: snapshot\ndata: ${JSON.stringify({ agents: [...agents.values()].map(viewAgent), feed: feed.slice(-60), usage, config: { studios: STUDIOS, wings: wings(), feedOnly: FEED_ONLY } })}\n\n`);
       clients.set(res, { id: url.searchParams.get('client') || crypto.randomUUID(), visible: url.searchParams.get('visible') === '1' });
       const ping = setInterval(() => res.write(': ping\n\n'), 20_000);
       req.on('close', () => { clearInterval(ping); clients.delete(res); });
@@ -382,6 +574,28 @@ const server = http.createServer(async (req, res) => {
         }
       }
       if (req.method === 'GET' && url.pathname === '/api/viewers') return json(res, 200, { viewers: clients.size, visibleViewers: visibleViewers() });
+      if (req.method === 'GET' && url.pathname.startsWith('/api/private/')) {
+        const id = decodeURIComponent(url.pathname.slice('/api/private/'.length));
+        const agent = agents.get(id);
+        if (!agent) return json(res, 404, { error: 'not found' });
+        if (!agent.private && !agent.privateDetail) return json(res, 200, { private: false });
+        const detail = agent.privateDetail || {};
+        return json(res, 200, {
+          private: !!agent.private,
+          id: agent.id,
+          name: agent.name,
+          status: agent.status,
+          updatedAt: agent.updatedAt,
+          ledgerAt: agent.ledgerAt || null,
+          detail: {
+            activity: detail.activity,
+            task: detail.task || null,
+            tasks: detail.tasks || null,
+            pending: detail.pending || null,
+            detail: detail.detail,
+          },
+        });
+      }
       return json(res, 404, { error: 'not found' });
     }
 
@@ -405,8 +619,14 @@ server.on('error', (err) => {
   process.exit(0);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Head Office is open at http://127.0.0.1:${PORT}`);
-  console.log(`  agents on the roster: ${[...agents.values()].map((a) => a.name).join(', ') || '(none yet)'}`);
-  if (codexWing()) console.log('  Codex found: the OpenAI wing is open');
-});
+async function boot() {
+  startLedger();
+  await startAdapters();
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`Head Office is open at http://127.0.0.1:${PORT}`);
+    console.log(`  agents on the roster: ${[...agents.values()].map((a) => a.name).join(', ') || '(none yet)'}`);
+    if (FEED_ONLY) console.log('  feed-only: cache adapters are off');
+    if (codexOn) console.log('  Codex found: the OpenAI wing is open');
+  });
+}
+boot();
